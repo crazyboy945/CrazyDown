@@ -1,0 +1,4 @@
+/target
+/.gui-test/
+*.iso
+server.pid

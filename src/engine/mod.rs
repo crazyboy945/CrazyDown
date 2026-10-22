@@ -5,12 +5,14 @@ pub(crate) mod segments;
 pub(crate) mod state;
 pub mod torrent;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +23,53 @@ use crate::ui::Ui;
 use crate::util;
 
 use output::{OutputPlan, OutputRegistry};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTypeRule {
+    pub name: String,
+    pub extensions: String,
+    pub dir: String,
+}
+
+impl FileTypeRule {
+    pub fn matches(&self, filename: &str) -> bool {
+        let extension = file_extension(filename);
+        self.extensions
+            .split([',', ';', ' ', '\t', '\n', '\r'])
+            .map(|token| token.trim().trim_start_matches('.').to_ascii_lowercase())
+            .any(|token| token == "*" || (!token.is_empty() && token == extension))
+    }
+}
+
+pub fn default_file_type_rules() -> Vec<FileTypeRule> {
+    let rule = |name: &str, extensions: &str, dir: &str| FileTypeRule {
+        name: name.into(),
+        extensions: extensions.into(),
+        dir: dir.into(),
+    };
+    vec![
+        rule(
+            "视频",
+            "mp4 mkv avi mov flv wmv webm m4v mpg mpeg ts",
+            "视频",
+        ),
+        rule("音频", "mp3 flac wav aac ogg m4a wma opus", "音频"),
+        rule(
+            "图片",
+            "jpg jpeg png gif webp bmp svg tiff heic ico",
+            "图片",
+        ),
+        rule(
+            "文档",
+            "pdf doc docx xls xlsx ppt pptx txt md epub mobi azw3",
+            "文档",
+        ),
+        rule("压缩包", "zip rar 7z tar gz bz2 xz zst iso img", "压缩包"),
+        rule("程序", "exe msi apk deb rpm dmg appimage", "程序"),
+        rule("种子", "torrent", "种子"),
+        rule("其他", "*", ""),
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -35,6 +84,7 @@ pub struct Options {
     pub insecure: bool,
     pub quiet: bool,
     pub no_progress: bool,
+    pub file_type_rules: Vec<FileTypeRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,7 +406,42 @@ pub(crate) fn reserve_output(
     explicit: Option<PathBuf>,
     suggested: &str,
 ) -> Result<OutputPlan> {
-    registry.choose(&opts.dir, suggested, explicit, opts.force)
+    let dir = if explicit.is_none() && !opts.file_type_rules.is_empty() {
+        Cow::Owned(type_dir(&opts.dir, &opts.file_type_rules, suggested))
+    } else {
+        Cow::Borrowed(&opts.dir)
+    };
+    registry.choose(&dir, suggested, explicit, opts.force)
+}
+
+fn type_dir(base: &Path, rules: &[FileTypeRule], filename: &str) -> PathBuf {
+    for rule in rules {
+        if !rule.matches(filename) {
+            continue;
+        }
+        let dir = rule.dir.trim();
+        if dir.is_empty() {
+            return base.to_path_buf();
+        }
+        let path = Path::new(dir);
+        return if path.is_absolute() {
+            util::absolutize(path)
+        } else {
+            util::absolutize(&base.join(path))
+        };
+    }
+    base.to_path_buf()
+}
+
+fn file_extension(filename: &str) -> String {
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(filename);
+    match name.rfind('.') {
+        Some(index) if index > 0 => name[index + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -379,5 +464,35 @@ mod tests {
         ));
         assert!(classify("gopher://example.com/file").is_err());
         assert!(classify("not a url").is_err());
+    }
+
+    #[test]
+    fn routes_known_file_types_to_rule_directories() {
+        let base = util::absolutize(Path::new("routes"));
+        let rules = default_file_type_rules();
+        assert_eq!(type_dir(&base, &rules, "movie.MP4"), base.join("视频"));
+        assert_eq!(
+            type_dir(&base, &rules, "archive.tar.gz"),
+            base.join("压缩包")
+        );
+        assert_eq!(type_dir(&base, &rules, "notes"), base);
+    }
+
+    #[test]
+    fn custom_file_type_rule_overrides_defaults() {
+        let base = util::absolutize(Path::new("custom-routes"));
+        let mut rules = default_file_type_rules();
+        rules.insert(
+            0,
+            FileTypeRule {
+                name: "安装包".into(),
+                extensions: ".exe, msi".into(),
+                dir: "Installers".into(),
+            },
+        );
+        assert_eq!(
+            type_dir(&base, &rules, "setup.exe"),
+            base.join("Installers")
+        );
     }
 }

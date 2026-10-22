@@ -10,6 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crazydown::cli::SourceSpec;
+use crazydown::engine::{self, FileTypeRule, Options};
+use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+
 const ETAG: &str = "\"crazy-it-v1\"";
 const LAST_MODIFIED: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
 const CHUNK: usize = 1024;
@@ -347,6 +352,53 @@ fn batch_list_downloads_multiple_files() {
     assert_success(&result);
     assert_eq!(fs::read(dir.join("alpha.bin")).unwrap(), data);
     assert_eq!(fs::read(dir.join("beta.bin")).unwrap(), data);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn http_downloads_can_route_by_file_type() {
+    let data = test_data(2048);
+    let server = TestServer::start(data.clone(), true);
+    let dir = temp_dir("file-type");
+    let custom = dir.join("custom.mp4");
+    let specs = vec![
+        SourceSpec {
+            source: server.url("/movie.mp4"),
+            output: None,
+        },
+        SourceSpec {
+            source: server.url("/clip.mp4"),
+            output: Some(custom.clone()),
+        },
+    ];
+    let options = Options {
+        dir: dir.clone(),
+        jobs: 2,
+        segments: 2,
+        retries: 0,
+        timeout: Duration::from_secs(10),
+        ftp_user: None,
+        ftp_pass: None,
+        force: false,
+        insecure: false,
+        quiet: true,
+        no_progress: true,
+        file_type_rules: vec![FileTypeRule {
+            name: "视频".into(),
+            extensions: "mp4".into(),
+            dir: "视频".into(),
+        }],
+    };
+
+    let summary = Runtime::new()
+        .unwrap()
+        .block_on(engine::run(specs, options, CancellationToken::new()))
+        .unwrap();
+
+    assert_eq!(summary.successes(), 2);
+    assert_eq!(fs::read(dir.join("视频/movie.mp4")).unwrap(), data);
+    assert_eq!(fs::read(&custom).unwrap(), data);
 
     fs::remove_dir_all(dir).unwrap();
 }

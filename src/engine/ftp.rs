@@ -862,6 +862,7 @@ mod tests {
             insecure: false,
             quiet: true,
             no_progress: true,
+            file_type_rules: Vec::new(),
         }
     }
 }

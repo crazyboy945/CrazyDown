@@ -34,6 +34,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         insecure: cli.insecure,
         quiet: cli.quiet,
         no_progress: cli.no_progress,
+        file_type_rules: Vec::new(),
     };
 
     if !cli.quiet {

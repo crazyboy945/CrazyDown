@@ -10,13 +10,14 @@ use eframe::egui::{
 };
 use egui_extras::{Column, TableBuilder};
 use indicatif::ProgressBar;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::SourceSpec;
-use crate::engine::{self, Options, SourceKind, output::OutputRegistry};
+use crate::engine::{self, FileTypeRule, Options, SourceKind, output::OutputRegistry};
 use crate::ui::Ui;
 use crate::util::{self, format_bytes, format_duration};
 
@@ -83,6 +84,8 @@ struct Settings {
     ftp_pass: String,
     force: bool,
     insecure: bool,
+    by_file_type: bool,
+    file_type_rules: Vec<FileTypeRule>,
 }
 
 impl Default for Settings {
@@ -97,7 +100,107 @@ impl Default for Settings {
             ftp_pass: String::new(),
             force: false,
             insecure: false,
+            by_file_type: false,
+            file_type_rules: engine::default_file_type_rules(),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSettings {
+    dir: String,
+    jobs: usize,
+    segments: usize,
+    retries: usize,
+    timeout_secs: u64,
+    ftp_user: String,
+    force: bool,
+    insecure: bool,
+    by_file_type: bool,
+    file_type_rules: Vec<FileTypeRule>,
+}
+
+impl From<&Settings> for PersistedSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            dir: settings.dir.clone(),
+            jobs: settings.jobs,
+            segments: settings.segments,
+            retries: settings.retries,
+            timeout_secs: settings.timeout_secs,
+            ftp_user: settings.ftp_user.clone(),
+            force: settings.force,
+            insecure: settings.insecure,
+            by_file_type: settings.by_file_type,
+            file_type_rules: settings.file_type_rules.clone(),
+        }
+    }
+}
+
+impl PersistedSettings {
+    fn into_settings(self) -> Settings {
+        let defaults = Settings::default();
+        Settings {
+            dir: if self.dir.trim().is_empty() {
+                defaults.dir
+            } else {
+                self.dir
+            },
+            jobs: self.jobs.clamp(1, 64),
+            segments: self.segments.clamp(1, 32),
+            retries: self.retries.min(20),
+            timeout_secs: self.timeout_secs.clamp(1, 3600),
+            ftp_user: self.ftp_user,
+            ftp_pass: String::new(),
+            force: self.force,
+            insecure: self.insecure,
+            by_file_type: self.by_file_type,
+            file_type_rules: if self.file_type_rules.is_empty() {
+                defaults.file_type_rules
+            } else {
+                self.file_type_rules
+            },
+        }
+    }
+}
+
+fn config_path() -> Option<PathBuf> {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return Some(PathBuf::from(appdata).join("crazydown").join("config.json"));
+    }
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config).join("crazydown").join("config.json"));
+    }
+    for variable in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(variable) {
+            return Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("crazydown")
+                    .join("config.json"),
+            );
+        }
+    }
+    None
+}
+
+fn load_settings() -> (Settings, Option<String>) {
+    let Some(path) = config_path() else {
+        return (Settings::default(), None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<PersistedSettings>(&text) {
+            Ok(persisted) => (persisted.into_settings(), None),
+            Err(error) => (
+                Settings::default(),
+                Some(format!("配置文件格式错误，已使用默认设置：{error}")),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
+        Err(error) => (
+            Settings::default(),
+            Some(format!("无法读取配置文件，已使用默认设置：{error}")),
+        ),
     }
 }
 
@@ -123,9 +226,6 @@ enum TaskFilter {
     Pending,
     Completed,
     Failed,
-    Http,
-    Ftp,
-    Torrent,
 }
 
 impl TaskFilter {
@@ -136,7 +236,6 @@ impl TaskFilter {
         Self::Completed,
         Self::Failed,
     ];
-    const PROTOCOLS: [Self; 3] = [Self::Http, Self::Ftp, Self::Torrent];
 
     fn label(self) -> &'static str {
         match self {
@@ -145,9 +244,6 @@ impl TaskFilter {
             Self::Pending => "等待中",
             Self::Completed => "已完成",
             Self::Failed => "失败 / 取消",
-            Self::Http => "HTTP",
-            Self::Ftp => "FTP",
-            Self::Torrent => "BitTorrent",
         }
     }
 
@@ -158,9 +254,6 @@ impl TaskFilter {
             Self::Pending => MUTED,
             Self::Completed => GREEN,
             Self::Failed => RED,
-            Self::Http => ACCENT,
-            Self::Ftp => ORANGE,
-            Self::Torrent => PURPLE,
         }
     }
 
@@ -171,9 +264,6 @@ impl TaskFilter {
             Self::Pending => task.status == TaskStatus::Pending,
             Self::Completed => task.status == TaskStatus::Completed,
             Self::Failed => matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled),
-            Self::Http => task.kind == SourceKind::Http,
-            Self::Ftp => task.kind == SourceKind::Ftp,
-            Self::Torrent => task.kind == SourceKind::Torrent,
         }
     }
 }
@@ -358,7 +448,6 @@ enum ToolbarAction {
 enum EmptyAction {
     None,
     Add,
-    Clear,
 }
 
 struct GuiApp {
@@ -403,6 +492,7 @@ impl GuiApp {
             .build()
             .expect("无法创建异步运行时");
 
+        let (settings, settings_warning) = load_settings();
         let mut app = Self {
             runtime,
             session: Arc::new(OnceCell::new()),
@@ -413,7 +503,7 @@ impl GuiApp {
             log_rx,
             tasks: Vec::new(),
             next_id: 1,
-            settings: Settings::default(),
+            settings,
             source_input: String::new(),
             add_error: None,
             logs: Vec::new(),
@@ -431,6 +521,9 @@ impl GuiApp {
             close_deadline: None,
         };
 
+        if let Some(warning) = settings_warning {
+            app.push_log(format!("警告: {warning}"));
+        }
         if initial_sources.is_empty() {
             app.push_log("就绪：新建下载，或导入批量列表 / 种子文件。");
         } else {
@@ -470,6 +563,11 @@ impl GuiApp {
             insecure: self.settings.insecure,
             quiet: true,
             no_progress: true,
+            file_type_rules: if self.settings.by_file_type {
+                self.settings.file_type_rules.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -609,6 +707,56 @@ impl GuiApp {
         }
         if let Some(path) = dialog.pick_folder() {
             self.settings.dir = path.display().to_string();
+            self.save_settings();
+        }
+    }
+
+    fn pick_rule_directory(&mut self, index: usize) {
+        let Some(rule) = self.settings.file_type_rules.get(index) else {
+            return;
+        };
+        let name = rule.name.trim().to_string();
+        let configured = rule.dir.trim().to_string();
+        let base = self.current_dir();
+        let path = Path::new(&configured);
+        let start = if path.is_absolute() {
+            util::absolutize(path)
+        } else {
+            util::absolutize(&base.join(path))
+        };
+
+        let title = if name.is_empty() {
+            "选择类型保存目录".to_string()
+        } else {
+            format!("选择 {name} 保存目录")
+        };
+        let mut dialog = rfd::FileDialog::new().set_title(&title);
+        if start.is_dir() {
+            dialog = dialog.set_directory(start);
+        } else if base.is_dir() {
+            dialog = dialog.set_directory(base);
+        }
+        if let Some(path) = dialog.pick_folder() {
+            self.settings.file_type_rules[index].dir = path.display().to_string();
+            self.save_settings();
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = config_path() else {
+            return;
+        };
+        let result = (|| -> Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("无法创建配置目录 {}", parent.display()))?;
+            }
+            let text = serde_json::to_string_pretty(&PersistedSettings::from(&self.settings))
+                .context("无法序列化设置")?;
+            std::fs::write(&path, text).with_context(|| format!("无法写入 {}", path.display()))
+        })();
+        if let Err(error) = result {
+            self.push_log(format!("警告: {error:#}"));
         }
     }
 
@@ -990,6 +1138,7 @@ impl GuiApp {
                 .close_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline);
             if self.active_count() == 0 || expired {
+                self.save_settings();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
@@ -1067,11 +1216,6 @@ impl GuiApp {
                                 .size(19.0)
                                 .strong()
                                 .color(Color32::from_rgb(235, 241, 250)),
-                        );
-                        ui.label(
-                            RichText::new("HTTP · HTTPS · FTP · BitTorrent 下载管理器")
-                                .size(10.5)
-                                .color(MUTED),
                         );
                     });
                 });
@@ -1292,15 +1436,6 @@ impl GuiApp {
                 chosen = filter;
             }
         }
-
-        ui.add_space(9.0);
-        ui.label(RichText::new("按协议").size(10.0).strong().color(SUBTLE));
-        ui.add_space(3.0);
-        for filter in TaskFilter::PROTOCOLS {
-            if category_row(ui, filter, self.filter_count(filter), self.filter == filter) {
-                chosen = filter;
-            }
-        }
         if chosen != self.filter {
             self.filter = chosen;
             self.selected = None;
@@ -1351,7 +1486,6 @@ impl GuiApp {
     }
 
     fn paint_tasks(&mut self, ui: &mut egui::Ui) {
-        let mut open_add = false;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(self.filter.label())
@@ -1386,18 +1520,6 @@ impl GuiApp {
         });
         ui.add_space(6.0);
 
-        if self.tasks.is_empty() {
-            match empty_state(ui, false) {
-                EmptyAction::Add => open_add = true,
-                EmptyAction::Clear => {}
-                EmptyAction::None => {}
-            }
-            if open_add {
-                self.open_add_modal();
-            }
-            return;
-        }
-
         let query = self.search.trim().to_lowercase();
         let visible: Vec<usize> = self
             .tasks
@@ -1413,16 +1535,8 @@ impl GuiApp {
             .map(|(index, _)| index)
             .collect();
 
-        if visible.is_empty() {
-            match empty_state(ui, true) {
-                EmptyAction::Add => open_add = true,
-                EmptyAction::Clear => {
-                    self.filter = TaskFilter::All;
-                    self.search.clear();
-                }
-                EmptyAction::None => {}
-            }
-            if open_add {
+        if visible.is_empty() && self.filter == TaskFilter::All && query.is_empty() {
+            if let EmptyAction::Add = empty_state(ui) {
                 self.open_add_modal();
             }
             return;
@@ -1856,7 +1970,7 @@ impl GuiApp {
 
     fn settings_modal_contents(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close = false;
-        ui.set_width(560.0);
+        ui.set_width(600.0);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("设置")
@@ -1876,7 +1990,11 @@ impl GuiApp {
                 .color(MUTED),
         );
 
-        section_title(ui, "下载");
+        egui::ScrollArea::vertical()
+            .max_height(410.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                section_title(ui, "下载");
         ui.horizontal(|ui| {
             ui.label("保存目录");
             let width = (ui.available_width() - 82.0).max(220.0);
@@ -1919,6 +2037,92 @@ impl GuiApp {
                 );
                 ui.end_row();
             });
+
+        section_title(ui, "按类型保存");
+        let _ = ui
+            .checkbox(&mut self.settings.by_file_type, "按文件类型保存到不同目录")
+            .on_hover_text("HTTP / FTP 根据最终文件名匹配类型；BT 仍使用会话目录");
+        if self.settings.by_file_type {
+            ui.label(
+                RichText::new("扩展名用空格或逗号分隔，* 表示其他类型。目录可填绝对路径或相对于默认保存目录的子目录。")
+                    .size(10.0)
+                    .color(SUBTLE),
+            );
+            let mut add_rule = false;
+            let mut reset_rules = false;
+            let mut delete_rule = None;
+            let mut browse_rule = None;
+            egui::CollapsingHeader::new("类型目录规则")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("添加类型").clicked() {
+                            add_rule = true;
+                        }
+                        if ui.button("恢复默认").clicked() {
+                            reset_rules = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(210.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (index, rule) in
+                                self.settings.file_type_rules.iter_mut().enumerate()
+                            {
+                                ui.push_id(index, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut rule.name)
+                                                .desired_width(72.0),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut rule.extensions)
+                                                .desired_width(310.0)
+                                                .hint_text("扩展名，例如 mp4 mkv 或 *"),
+                                        );
+                                        if ui.button("删除").clicked() {
+                                            delete_rule = Some(index);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("目录");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut rule.dir)
+                                                .desired_width(395.0)
+                                                .hint_text("留空使用默认保存目录"),
+                                        );
+                                        if ui.button("浏览…").clicked() {
+                                            browse_rule = Some(index);
+                                        }
+                                    });
+                                    ui.separator();
+                                });
+                            }
+                        });
+                });
+            if add_rule {
+                self.settings.file_type_rules.push(FileTypeRule {
+                    name: "新类型".into(),
+                    extensions: String::new(),
+                    dir: String::new(),
+                });
+                self.save_settings();
+            }
+            if reset_rules {
+                self.settings.file_type_rules = engine::default_file_type_rules();
+                self.save_settings();
+            }
+            if let Some(index) = delete_rule
+                && index < self.settings.file_type_rules.len()
+            {
+                self.settings.file_type_rules.remove(index);
+                self.save_settings();
+            }
+            if let Some(index) = browse_rule {
+                self.pick_rule_directory(index);
+            }
+        }
 
         section_title(ui, "FTP 认证");
         ui.horizontal(|ui| {
@@ -1965,6 +2169,7 @@ impl GuiApp {
                 .color(SUBTLE),
             );
         }
+            });
 
         ui.add_space(12.0);
         ui.separator();
@@ -1981,6 +2186,9 @@ impl GuiApp {
             });
         });
 
+        if close {
+            self.save_settings();
+        }
         close
     }
 }
@@ -2051,7 +2259,7 @@ async fn run_task(job: TaskJob<'_>) -> Result<PathBuf> {
     }
 }
 
-fn empty_state(ui: &mut egui::Ui, filtered: bool) -> EmptyAction {
+fn empty_state(ui: &mut egui::Ui) -> EmptyAction {
     let mut action = EmptyAction::None;
     ui.add_space((ui.available_height() * 0.18).min(84.0));
     ui.vertical_centered(|ui| {
@@ -2083,40 +2291,18 @@ fn empty_state(ui: &mut egui::Ui, filtered: bool) -> EmptyAction {
 
         ui.add_space(10.0);
         ui.label(
-            RichText::new(if filtered {
-                "没有符合条件的任务"
-            } else {
-                "还没有下载任务"
-            })
-            .size(16.0)
-            .strong()
-            .color(Color32::from_rgb(222, 232, 245)),
+            RichText::new("还没有下载任务")
+                .size(16.0)
+                .strong()
+                .color(Color32::from_rgb(222, 232, 245)),
         );
         ui.label(
-            RichText::new(if filtered {
-                "试试其他分类，或清空搜索条件"
-            } else {
-                "支持 HTTP / HTTPS / FTP 链接、磁力链接和 .torrent 文件"
-            })
-            .size(10.5)
-            .color(MUTED),
+            RichText::new("支持 HTTP / HTTPS / FTP 链接、磁力链接和 .torrent 文件")
+                .size(10.5)
+                .color(MUTED),
         );
         ui.add_space(12.0);
-        if filtered {
-            ui.allocate_ui_with_layout(
-                vec2(184.0, 30.0),
-                egui::Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if secondary_button(ui, "查看全部任务").clicked() {
-                        action = EmptyAction::Clear;
-                    }
-                    if primary_button(ui, "新建下载").clicked() {
-                        action = EmptyAction::Add;
-                    }
-                },
-            );
-        } else if primary_button(ui, "新建下载").clicked() {
+        if primary_button(ui, "新建下载").clicked() {
             action = EmptyAction::Add;
         }
     });
@@ -2280,21 +2466,6 @@ fn draw_filter_icon(painter: &egui::Painter, filter: TaskFilter, rect: Rect, col
                 Stroke::new(1.5_f32, color),
             );
             painter.circle_filled(center + vec2(0.0, 4.0), 1.0, color);
-        }
-        TaskFilter::Http | TaskFilter::Ftp | TaskFilter::Torrent => {
-            let text = match filter {
-                TaskFilter::Http => "H",
-                TaskFilter::Ftp => "F",
-                _ => "B",
-            };
-            painter.rect_filled(rect, 3.0, color.gamma_multiply(0.16));
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                text,
-                FontId::proportional(8.5),
-                color,
-            );
         }
     }
 }
@@ -2762,9 +2933,8 @@ mod tests {
         let mut task = GuiTask::new(1, spec, SourceKind::Http, PathBuf::from("."));
         task.status = TaskStatus::Cancelled;
         assert!(TaskFilter::Failed.matches(&task));
-        assert!(TaskFilter::Http.matches(&task));
         assert!(!TaskFilter::Completed.matches(&task));
-        assert!(!TaskFilter::Ftp.matches(&task));
+        assert!(!TaskFilter::Pending.matches(&task));
     }
 
     #[test]
